@@ -2,5 +2,5 @@
 
 auth {{ keyring_file }}:
   cmd.run:
-    - name: "ceph auth add {{ client }} -i {{ keyring_file }}"
+    - name: "ceph auth add client.nova -i {{ keyring_file }}"
 

@@ -9,6 +9,7 @@
     - mode: 600
     - makedirs: True
     - context:
+      client: client.nova
       secret: {{ salt['keyring.secret'](keyring_file) }}
     - fire_event: True
 
