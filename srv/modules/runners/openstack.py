@@ -48,24 +48,24 @@ def integrate():
             'cluster_network': list(local.cmd(master_minion, 'pillar.get', ['cluster_network']).items())[0][1]
         },
         'pools': {
-            'volumes': {
-                'name': 'cinder',
-                'user': 'client.cinder',
+            'cinder': {
+                'rbd_store_pool': 'cinder',
+                'rbd_store_user': 'cinder',
                 'key': list(local.cmd(master_minion, 'keyring.secret', [
                         list(local.cmd(master_minion, 'keyring.file', ['cinder']).items())[0][1]
                     ]).items())[0][1]
             },
-            'images': {
-                'name': 'glance',
-                'user': 'client.glance',
+            'glance': {
+                'rbd_store_pool': 'glance',
+                'rbd_store_user': 'glance',
                 'key': list(local.cmd(master_minion, 'keyring.secret', [
                         list(local.cmd(master_minion, 'keyring.file', ['glance']).items())[0][1]
                     ]).items())[0][1]
             },
-            'backups': {},
-            'vms': {
-                'name': 'nova',
-                'user': 'client.nova',
+            'cinder-backup': {},
+            'nova': {
+                'rbd_store_pool': 'nova',
+                'rbd_store_user': 'nova',
                 'key': list(local.cmd(master_minion, 'keyring.secret', [
                         list(local.cmd(master_minion, 'keyring.file', ['nova']).items())[0][1]
                     ]).items())[0][1]
