@@ -13,14 +13,17 @@ import salt.client
 # Allow pools to pre-exist (storage admin creates them first).  This "should
 # just work", actually, but needs to be documented.
 
-def integrate():
+def integrate(**kwargs):
     local = salt.client.LocalClient()
 
-    # TODO: needs to be tgt_type, not expr_form for salt >= 2017.7.0
     master_minion = list(local.cmd('I@roles:master', 'pillar.get',
-        ['master_minion'], expr_form='compound').items())[0][1]
+        ['master_minion'], tgt_type='compound').items())[0][1]
 
-    state_res = local.cmd(master_minion, 'state.apply', ['ceph.openstack'])
+    if "prefix" in kwargs:
+        state_res = local.cmd(master_minion, 'state.apply', ['ceph.openstack',
+            'pillar={"openstack_prefix": "' + kwargs['prefix'] + '"}' ])
+    else:
+        state_res = local.cmd(master_minion, 'state.apply', ['ceph.openstack'])
 
     # TODO: return something more sensible/intelligible on failure
     #       (no, really, the failure case hasn't even been tested!)
@@ -39,6 +42,12 @@ def integrate():
 
     runner = salt.runner.RunnerClient(__opts__)
 
+    # Set up prefix for subsequent string concatenation to match what's done
+    # in the SLS files for keyring and pool names.
+    prefix = ""
+    if "prefix" in kwargs:
+        prefix = kwargs['prefix'] + "-"
+
     return {
         'conf': {
             'fsid': list(local.cmd(master_minion, 'pillar.get', ['fsid']).items())[0][1],
@@ -49,25 +58,31 @@ def integrate():
         },
         'pools': {
             'cinder': {
-                'rbd_store_pool': 'cinder',
-                'rbd_store_user': 'cinder',
+                'rbd_store_pool': prefix + 'volumes',
+                'rbd_store_user': prefix + 'cinder',
                 'key': list(local.cmd(master_minion, 'keyring.secret', [
-                        list(local.cmd(master_minion, 'keyring.file', ['cinder']).items())[0][1]
+                        list(local.cmd(master_minion, 'keyring.file', ['cinder', prefix]).items())[0][1]
+                    ]).items())[0][1]
+            },
+            'cinder-backup': {
+                'rbd_store_pool': prefix + 'backups',
+                'rbd_store_user': prefix + 'cinder-backup',
+                'key': list(local.cmd(master_minion, 'keyring.secret', [
+                        list(local.cmd(master_minion, 'keyring.file', ['cinder-backup', prefix]).items())[0][1]
                     ]).items())[0][1]
             },
             'glance': {
-                'rbd_store_pool': 'glance',
-                'rbd_store_user': 'glance',
+                'rbd_store_pool': prefix + 'images',
+                'rbd_store_user': prefix + 'glance',
                 'key': list(local.cmd(master_minion, 'keyring.secret', [
-                        list(local.cmd(master_minion, 'keyring.file', ['glance']).items())[0][1]
+                        list(local.cmd(master_minion, 'keyring.file', ['glance', prefix]).items())[0][1]
                     ]).items())[0][1]
             },
-            'cinder-backup': {},
             'nova': {
-                'rbd_store_pool': 'nova',
-                'rbd_store_user': 'nova',
+                'rbd_store_pool': prefix + 'vms',
+                'rbd_store_user': prefix + 'nova',
                 'key': list(local.cmd(master_minion, 'keyring.secret', [
-                        list(local.cmd(master_minion, 'keyring.file', ['nova']).items())[0][1]
+                        list(local.cmd(master_minion, 'keyring.file', ['nova', prefix]).items())[0][1]
                     ]).items())[0][1]
             }
         }
