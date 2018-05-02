@@ -231,7 +231,7 @@ class OSDWeight(object):
         self.osd_id = _id
         self.settings = {
             'conf': "/etc/ceph/ceph.conf",
-            'filename': '/var/run/ceph/osd.{}-weight'.format(id),
+            'filename': '/var/run/ceph/osd.{}-weight'.format(_id),
             'timeout': 60,
             'keyring': '/etc/ceph/ceph.client.admin.keyring',
             'client': 'client.admin',
@@ -339,8 +339,9 @@ class OSDWeight(object):
             i += 1
             time.sleep(self.settings['delay'])
 
-        log.debug("Timeout expired")
-        raise RuntimeError("Timeout expired")
+        msg = "Timeout expired - OSD {} has {} PGs remaining".format(self.osd_id, last_pgs)
+        log.error(msg)
+        return msg
 
 
 class CephPGs(object):
@@ -1205,7 +1206,7 @@ class OSDCommands(object):
             args += "{}".format(self.osd.device)
         return args
 
-    def prepare(self):
+    def prepare(self, osd_id=None):
         """
         Generate the correct prepare command.
 
@@ -1228,6 +1229,9 @@ class OSDCommands(object):
         if self.osd.device:
             cmd = "PYTHONWARNINGS=ignore ceph-disk -v prepare "
 
+            # OSD ID
+            if osd_id:
+                cmd += "--osd-id {} ".format(osd_id)
             # Dmcrypt
             if self.osd.encryption == 'dmcrypt':
                 cmd += "--dmcrypt "
@@ -1406,16 +1410,23 @@ class OSDRemove(object):
         """
         self.osd_id = osd_id
         self.osd_fsid = device.osd_fsid
-        self.partitions = self.set_partitions(device)
+        self.device = device
+        self.partitions = self.set_partitions()
         self._weight = weight
         self._grains = grains
         self.force = force
+        self.keyring = None
+        self.client = None
+        if 'keyring' in kwargs:
+            self.keyring = kwargs['keyring']
+        if 'client' in kwargs:
+            self.client = kwargs['client']
 
-    def set_partitions(self, device):
+    def set_partitions(self):
         """
         Return queried partitions or fallback to grains
         """
-        _partitions = device.partitions(self.osd_id)
+        _partitions = self.device.partitions(self.osd_id)
         if not _partitions:
             log.debug("grains: \n{}".format(pprint.pformat(__grains__['ceph'])))
             if str(self.osd_id) in __grains__['ceph']:
@@ -1437,22 +1448,56 @@ class OSDRemove(object):
 
         if self.force:
             log.warning("Forcing OSD removal")
-        else:
-            self.empty()
 
-        # Terminate
-        self.terminate()
+            # Terminate
+            self.terminate()
+
+            # Best effort depending on the reason for the forced removal
+            self.mark_destroyed()
+            update_destroyed(self._osd_disk(), self.osd_id)
+        else:
+            msg = self.empty()
+            if msg:
+                return msg
+
+            # Terminate
+            msg = self.terminate()
+            if msg:
+                return msg
+
+            # Inform Ceph
+            #
+            # Consider this a hard requirement for graceful removal. If the
+            # OSD cannot be marked and recorded, stop the process.
+            if self.mark_destroyed():
+                msg = update_destroyed(self._osd_disk(), self.osd_id)
+                if msg:
+                    log.error(msg)
+                    return msg
+                log.debug("OSD {} marked and recorded".format(self.osd_id))
+            else:
+                msg = "Failed to mark OSD {} as destroyed".format(self.osd_id)
+                log.error(msg)
+                return msg
 
         # Unmount filesystems
-        result = self.unmount()
-        if result:
-            return result
+        msg = self.unmount()
+        if msg:
+            return msg
 
         # Wipe partitions
-        self.wipe()
+        msg = self.wipe()
+        if msg:
+            return msg
 
         # Destroy partitions
-        self.destroy()
+        msg = self.destroy()
+        if msg:
+            return msg
+
+        # Remove grain
+        self._grains.delete(self.osd_id)
+
         return ""
 
     def empty(self):
@@ -1465,25 +1510,27 @@ class OSDRemove(object):
             msg = "Reweight failed"
             log.error(msg)
             return msg
-        self._weight.wait()
-        return ""
+        return self._weight.wait()
 
     def terminate(self):
         """
         Stop the ceph-osd without error
         """
-        # Check weight is zero
         cmd = "systemctl disable ceph-osd@{}".format(self.osd_id)
         __salt__['helper.run'](cmd)
-        # How long with this hang on a broken OSD
+        # How long will this hang on a broken OSD
         cmd = "systemctl stop ceph-osd@{}".format(self.osd_id)
         __salt__['helper.run'](cmd)
-        cmd = r"pkill -f ceph-osd.*{}\ --".format(self.osd_id)
+        cmd = r"pkill -f ceph-osd.*id\ {}".format(self.osd_id)
         __salt__['helper.run'](cmd)
         time.sleep(1)
-        cmd = r"pkill -9 -f ceph-osd.*{}\ --".format(self.osd_id)
+        cmd = r"pkill -9 -f ceph-osd.*id\ {}".format(self.osd_id)
         __salt__['helper.run'](cmd)
         time.sleep(1)
+        cmd = r"pgrep -f ceph-osd.*id\ {}".format(self.osd_id)
+        _rc, _stdout, _stderr = __salt__['helper.run'](cmd)
+        if _rc == 0:
+            return "Failed to terminate OSD {} - pid {}".format(self.osd_id, _stdout)
         return ""
 
     def unmount(self):
@@ -1531,12 +1578,13 @@ class OSDRemove(object):
         if self.partitions:
             for _, _partition in six.iteritems(self.partitions):
                 if os.path.exists(_partition):
-                    cmd = "dd if=/dev/zero of={} bs=4096 count=1 oflag=direct".format(_partition)
-                    __salt__['helper.run'](cmd)
+                    cmd = "dd if=/dev/zero of={} bs=4M count=1 oflag=direct".format(_partition)
+                    _rc, _stdout, _stderr = __salt__['helper.run'](cmd)
+                    if _rc != 0:
+                        return "Failed to wipe partition {}".format(_partition)
         else:
             msg = "Nothing to wipe - no partitions available"
-            log.error(msg)
-            return msg
+            log.warning(msg)
         return ""
 
     def destroy(self):
@@ -1545,9 +1593,15 @@ class OSDRemove(object):
         """
         # pylint: disable=attribute-defined-outside-init
         self.osd_disk = self._osd_disk()
-        self._delete_partitions()
+        msg = self._delete_partitions()
+        if msg:
+            return msg
         self._wipe_gpt_backups()
-        self._delete_osd()
+
+        msg = self._delete_osd()
+        if msg:
+            return msg
+
         self._settle()
         return ""
 
@@ -1589,9 +1643,12 @@ class OSDRemove(object):
                     if disk:
                         log.debug("disk: {} partition: {}".format(disk, _partition))
                         cmd = "sgdisk -d {} {}".format(_partition, disk)
-                        __salt__['helper.run'](cmd)
+                        _rc, _stdout, _stderr = __salt__['helper.run'](cmd)
+                        if _rc != 0:
+                            return "Failed to delete partition {} on {}".format(_partition, disk)
             else:
                 log.error("Partition {} does not exist".format(short_name))
+        return ""
 
     def _wipe_gpt_backups(self):
         """
@@ -1605,7 +1662,7 @@ class OSDRemove(object):
             cmd = ("dd if=/dev/zero of={} bs=4096 count=33 seek={} "
                    "oflag=direct".format(self.osd_disk, seek_position))
             __salt__['helper.run'](cmd)
-            return ""
+        return ""
 
     def _delete_osd(self):
         """
@@ -1615,7 +1672,10 @@ class OSDRemove(object):
             cmd = "sgdisk -Z --clear -g {}".format(self.osd_disk)
             _rc, _stdout, _stderr = __salt__['helper.run'](cmd)
             if _rc != 0:
-                raise RuntimeError("{} failed".format(cmd))
+                msg = "Failed to delete OSD {}".format(self.osd_disk)
+                log.error(msg)
+                return msg
+        return ""
 
     # pylint: disable=no-self-use
     def _settle(self):
@@ -1626,6 +1686,17 @@ class OSDRemove(object):
                     'partprobe',
                     'udevadm settle --timeout=20']:
             __salt__['helper.run'](cmd)
+
+    def mark_destroyed(self):
+        """
+        Mark the ID as destroyed in Ceph
+        """
+        auth = ""
+        if self.keyring and self.client:
+            auth = "--keyring={} --name={}".format(self.keyring, self.client)
+        cmd = "ceph {} osd destroy {} --yes-i-really-mean-it".format(auth, self.osd_id)
+        _rc, _stdout, _stderr = __salt__['helper.run'](cmd)
+        return _rc == 0
 
 
 def remove(osd_id, **kwargs):
@@ -1641,7 +1712,7 @@ def remove(osd_id, **kwargs):
     osdd = OSDDevices()
     osdg = OSDGrains(osdd)
 
-    osdr = OSDRemove(osd_id, osdd, osdw, osdg, **kwargs)
+    osdr = OSDRemove(osd_id, osdd, osdw, osdg, **settings)
     return osdr.remove()
 
 
@@ -1784,6 +1855,155 @@ class OSDDevices(object):
         return index
 
 
+class OSDDestroyed(object):
+    """
+    Maintain a key value store for destroyed OSDs.
+
+    The workflow can get complicated.  The first case is the normal case.  The
+    use cases are
+
+    1) Device has a by-path equivalent.  Save the by-path name and ID
+    2) Device has no by-path equivalent.  Save the current device name as an
+       indication to future runs that this device can safely be skipped. On
+       the first attempt, return as failed with instructions.
+    3) Admin is saving actual device name of new device.
+    """
+
+    def __init__(self):
+        """
+        Set the default filename.
+        """
+        self.filename = "/etc/ceph/destroyedOSDs.yml"
+
+        # Keep yaml human readable/editable
+        self.friendly_dumper = yaml.SafeDumper
+        self.friendly_dumper.ignore_aliases = lambda self, data: True
+
+    def update(self, device, osd_id, force=False):
+        """
+        Add the by-path version of device and osd_id.  If by-path does not
+        exist, record current device and issue exception with instructions.
+        If forced, record current device.
+        """
+        content = {}
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as destroyed:
+                content = yaml.safe_load(destroyed)
+                log.debug("content: {} {}".format(type(content), content))
+
+        if device in content:
+            # Exit early, no by-pass equivalent from previous run
+            return ""
+
+        by_path = self._by_path(device)
+        if by_path and not force:
+            content[by_path] = osd_id
+        else:
+            # by-path device is missing, save current device to allow
+            # the OSD to be removed and rely on admin following instructions
+            # below OR admin is overriding the save manually with the new
+            # device name.  In either case, save the device name with the ID.
+            content[device] = osd_id
+
+        with open(self.filename, 'w') as destroyed:
+            destroyed.write(yaml.dump(content, Dumper=self.friendly_dumper,
+                            default_flow_style=False))
+
+        if by_path or force:
+            return ""
+
+        # Hard enough to read without the else indent
+        example = '/dev/disk/by-id/scsi-SATA_INTEL_SSDSC2BA40_BTHV6082036Q400NGN'
+        msg = """Device {} is missing a /dev/disk/by-path link.  Device cannot
+                 be replaced automatically.\n\nReplace the device, find the new
+                 device name and run \nsalt {} osd.update_destroyed {}
+                 force=True""".format(device, __grains__['id'], example)
+        log.error(msg)
+        return msg
+
+    def get(self, device):
+        """
+        Return ID
+        """
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as destroyed:
+                content = yaml.safe_load(destroyed)
+            by_path = self._by_path(device)
+            if by_path and by_path in content:
+                return content[by_path]
+
+    # pylint: disable=no-self-use
+    def _by_path(self, device):
+        """
+        Return the equivalent by-path device name
+        """
+        cmd = (r"find -L /dev/disk/by-path -samefile {}".format(device))
+        _rc, _stdout, _stderr = __salt__['helper.run'](cmd)
+        if _stdout:
+            _devices = _stdout.split()
+            if _devices[0]:
+                return _devices[0]
+
+    def remove(self, device):
+        """
+        Remove entry
+        """
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as destroyed:
+                content = yaml.safe_load(destroyed)
+            by_path = self._by_path(device)
+            if by_path and by_path in content:
+                del content[by_path]
+            # Normally absent
+            if device in content:
+                del content[device]
+            with open(self.filename, 'w') as destroyed:
+                destroyed.write(yaml.dump(content, Dumper=self.friendly_dumper,
+                                default_flow_style=False))
+
+    def dump(self):
+        """
+        Display all devices, IDs
+        """
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as destroyed:
+                content = yaml.safe_load(destroyed)
+            return content
+
+
+def update_destroyed(device, osd_id):
+    """
+    Save the ID
+    """
+    osd_d = OSDDestroyed()
+    return osd_d.update(device, osd_id)
+
+
+def find_destroyed(device):
+    """
+    Return the ID for a device
+    """
+    osd_d = OSDDestroyed()
+    return osd_d.get(str(device))
+
+
+def remove_destroyed(device):
+    """
+    Remove the device
+    """
+    osd_d = OSDDestroyed()
+    osd_d.remove(device)
+    return ""
+
+
+def dump_destroyed():
+    """
+    Display all devices, IDs
+    """
+    osd_d = OSDDestroyed()
+    return osd_d.dump()
+
+
 # pylint: disable=too-few-public-methods
 class OSDGrains(object):
     """
@@ -1795,11 +2015,12 @@ class OSDGrains(object):
     remove this entry.
     """
 
-    def __init__(self, device, pathname="/var/lib/ceph/osd"):
+    def __init__(self, device, pathname="/var/lib/ceph/osd", filename="/etc/salt/grains"):
         """
         Initialize settings
         """
         self.pathname = pathname
+        self.filename = filename
         self.partitions = device.partitions
         self.osd_fsid = device.osd_fsid
 
@@ -1817,32 +2038,48 @@ class OSDGrains(object):
                 log.debug("osd {}: {}".format(osd_id, pprint.pformat(storage[osd_id])))
         self._grains(storage)
 
-    def _grains(self, storage, filename="/etc/salt/grains"):
+    def delete(self, osd_id):
+        """
+        Delete an OSD entry
+        """
+        content = {}
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as minion_grains:
+                content = yaml.safe_load(minion_grains)
+                # pylint: disable=bare-except
+                try:
+                    del content['ceph'][str(osd_id)]
+                except:
+                    log.error("Cannot delete osd {} from grains".format(osd_id))
+            if content:
+                self._update_grains(content)
+
+    def _grains(self, storage):
         """
         Load and save grains when changed
         """
         content = {}
-        if os.path.exists(filename):
-            with open(filename, 'r') as minion_grains:
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as minion_grains:
                 content = yaml.safe_load(minion_grains)
         if 'ceph' in content and content['ceph'] == storage:
-            log.debug("No update for {}".format(filename))
+            log.debug("No update for {}".format(self.filename))
         else:
             content['ceph'] = storage
             self._update_grains(content)
 
     # pylint: disable=no-self-use
-    def _update_grains(self, content, filename="/etc/salt/grains"):
+    def _update_grains(self, content):
         """
         Update the yaml file without destroying other content
         """
-        log.info("Updating {}".format(filename))
+        log.info("Updating {}".format(self.filename))
 
         # Keep yaml human readable/editable
         friendly_dumper = yaml.SafeDumper
         friendly_dumper.ignore_aliases = lambda self, data: True
 
-        with open(filename, 'w') as minion_grains:
+        with open(self.filename, 'w') as minion_grains:
             minion_grains.write(yaml.dump(content,
                                           Dumper=friendly_dumper,
                                           default_flow_style=False))
@@ -1891,8 +2128,12 @@ def deploy():
             osdp.clean()
             osdp.partition()
             osdc = OSDCommands(config)
-            __salt__['helper.run'](osdc.prepare())
+            previous_id = find_destroyed(device)
+            __salt__['helper.run'](osdc.prepare(previous_id))
             __salt__['helper.run'](osdc.activate())
+            remove_destroyed(device)
+            if previous_id:
+                restore_weight(previous_id)
 
 
 def redeploy(simultaneous=False, **kwargs):
@@ -1913,10 +2154,6 @@ def redeploy(simultaneous=False, **kwargs):
     settings = _settings(**kwargs)
     for _id in __grains__['ceph']:
         _part = _partition(_id)
-        # if 'lockbox' in __grains__['ceph'][_id]['partitions']:
-        #     partition = __grains__['ceph'][_id]['partitions']['lockbox']
-        # else:
-        #     partition = __grains__['ceph'][_id]['partitions']['osd']
         log.info("Partition: {}".format(_part))
         disk, _ = split_partition(_part)
         log.info("ID: {}".format(_id))
@@ -1929,9 +2166,10 @@ def redeploy(simultaneous=False, **kwargs):
             osdp = OSDPartitions(config)
             osdp.partition()
             osdc = OSDCommands(config)
-            __salt__['helper.run'](osdc.prepare())
+            __salt__['helper.run'](osdc.prepare(_id))
+            restore_weight(_id)
             __salt__['helper.run'](osdc.activate())
-            # not is_prepared(disk)):
+            remove_destroyed(disk)
 
 
 def _partition(osd_id):
@@ -1997,7 +2235,7 @@ def is_activated(device):
     return "/bin/false"
 
 
-def prepare(device):
+def prepare(device, osd_id=None):
     """
     Return ceph-disk command to prepare OSD.
 
@@ -2007,7 +2245,7 @@ def prepare(device):
     """
     config = OSDConfig(device)
     osdc = OSDCommands(config)
-    return osdc.prepare()
+    return osdc.prepare(osd_id)
 
 
 def activate(device):
@@ -2052,27 +2290,35 @@ def retain():
     return osdg.retain()
 
 
-def report(failhard=False):
+def delete_grain(osd_id):
+    """
+    Delete an individual OSD grain
+    """
+    osdd = OSDDevices()
+    osdg = OSDGrains(osdd)
+    return osdg.delete(osd_id)
+
+
+def report(failhard=False, human=True):
     """
     Display the difference between the pillar and grains for the OSDs
 
     Note: this needs more bullet proofing
     """
-    if 'ceph' not in __grains__:
-        return "No ceph grain available.  Run osd.retain"
     active = []
     unmounted = []
-    for _id in __grains__['ceph']:
-        _partition = readlink(__grains__['ceph'][_id]['partitions']['osd'])
-        disk, _ = split_partition(_partition)
-        active.append(disk)
-        log.debug("checking /var/lib/ceph/osd/ceph-{}/fsid".format(_id))
-        if not os.path.exists("/var/lib/ceph/osd/ceph-{}/fsid".format(_id)):
-            unmounted.append(disk)
-        if 'lockbox' in __grains__['ceph'][_id]['partitions']:
-            _partition = readlink(__grains__['ceph'][_id]['partitions']['lockbox'])
+    if 'ceph' in __grains__:
+        for _id in __grains__['ceph']:
+            _partition = readlink(__grains__['ceph'][_id]['partitions']['osd'])
             disk, _ = split_partition(_partition)
             active.append(disk)
+            log.debug("checking /var/lib/ceph/osd/ceph-{}/fsid".format(_id))
+            if not os.path.exists("/var/lib/ceph/osd/ceph-{}/fsid".format(_id)):
+                unmounted.append(disk)
+            if 'lockbox' in __grains__['ceph'][_id]['partitions']:
+                _partition = readlink(__grains__['ceph'][_id]['partitions']['lockbox'])
+                disk, _ = split_partition(_partition)
+                active.append(disk)
 
     log.debug("active: {}".format(active))
 
@@ -2108,20 +2354,25 @@ def report(failhard=False):
                 log.debug("Removed from changed {}".format(osd))
                 changed.remove(osd)
 
-    if unconfigured or changed or unmounted:
-        msg = ""
-        if unconfigured:
-            msg += "No OSD configured for \n{}\n".format("\n".join(unconfigured))
-        if changed:
-            msg += "Different configuration for \n{}\n".format("\n".join(changed))
-        if unmounted:
-            msg += "No OSD mounted for \n{}\n".format("\n".join(unmounted))
-        if failhard:
-            raise RuntimeError(msg)
+    if human:
+        if unconfigured or changed or unmounted:
+            msg = ""
+            if unconfigured:
+                msg += "No OSD configured for \n{}\n".format("\n".join(unconfigured))
+            if changed:
+                msg += "Different configuration for \n{}\n".format("\n".join(changed))
+            if unmounted:
+                msg += "No OSD mounted for \n{}\n".format("\n".join(unmounted))
+            if failhard:
+                raise RuntimeError(msg)
+            else:
+                return msg
         else:
-            return msg
+            return "All configured OSDs are active"
     else:
-        return "All configured OSDs are active"
+        return {'unconfigured': unconfigured,
+                'changed': changed,
+                'unmounted': unmounted}
 
 
 __func_alias__ = {
