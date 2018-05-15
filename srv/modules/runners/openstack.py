@@ -39,11 +39,6 @@ def integrate(**kwargs):
     if failed:
         return failed
 
-    # TODO: interestingly, using the runner to invoke select.minions and
-    # select.public_addresses results in those things being printed to the
-    # console, outside of the return dict.  Not a problem when accessed via
-    # REST though.
-
     runner = salt.runner.RunnerClient(__opts__)
 
     # Set up prefix for subsequent string concatenation to match what's done
@@ -55,8 +50,8 @@ def integrate(**kwargs):
     return {
         'conf': {
             'fsid': list(local.cmd(master_minion, 'pillar.get', ['fsid']).items())[0][1],
-            'mon_initial_members': runner.cmd('select.minions', kwarg = {'cluster': 'ceph', 'roles': 'mon', 'host': True}),
-            'mon_host': runner.cmd('select.public_addresses', kwarg = {'cluster': 'ceph', 'roles': 'mon'}),
+            'mon_initial_members': runner.cmd('select.minions', ['cluster=ceph', 'roles=mon', 'host=True'], print_event=False),
+            'mon_host': runner.cmd('select.public_addresses', ['cluster=ceph', 'roles=mon'], print_event=False),
             'public_network': list(local.cmd(master_minion, 'pillar.get', ['public_network']).items())[0][1],
             'cluster_network': list(local.cmd(master_minion, 'pillar.get', ['cluster_network']).items())[0][1]
         },
