@@ -16,8 +16,12 @@ import salt.client
 def integrate(**kwargs):
     local = salt.client.LocalClient()
 
-    master_minion = list(local.cmd('I@roles:master', 'pillar.get',
-        ['master_minion'], tgt_type='compound').items())[0][1]
+    __opts__ = salt.config.client_config('/etc/salt/master')
+    __grains__ = salt.loader.grains(__opts__)
+    __opts__['grains'] = __grains__
+    __utils__ = salt.loader.utils(__opts__)
+    __salt__ = salt.loader.minion_mods(__opts__, utils=__utils__)
+    master_minion = __salt__['master.minion']()
 
     if "prefix" in kwargs:
         state_res = local.cmd(master_minion, 'state.apply', ['ceph.openstack',
