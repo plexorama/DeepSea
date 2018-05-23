@@ -9,6 +9,7 @@ import logging
 import time
 import os
 import pwd
+import re
 import shlex
 # pylint: disable=import-error,3rd-party-module-not-gated
 from subprocess import Popen, PIPE
@@ -49,6 +50,56 @@ processes = {'mon': ['ceph-mon'],
 absent_processes = {'igw': ['lrbd']}
 
 
+class ProcInfo(object):
+
+    def __init__(self, proc):
+        # the proc object
+        self.proc = proc
+        # e.g. python3, perl, etc
+        self.exe = os.path.basename(proc.exe())
+        # e.g. salt-call, ceph-osd
+        self.name = proc.name()
+        # e.g. systems pid
+        self.pid = proc.pid
+        # uid the proc is running under.
+        self.uid = proc.uids().real
+        # uid to name. (root, salt.. etc)
+        self.uid_name = pwd.getpwuid(self.uid).pw_name
+        if self.name == 'ceph-osd':
+            self.osd_id = self._map_osd_proc_to_osd_id()
+        else:
+            self.osd_id = None
+        if 'python' in self.exe:
+            self.exe = self.name
+        self.up = False
+
+    def __repr__(self):
+        return "Process <{}>".format(self.name)
+
+    def _map_osd_proc_to_osd_id(self):
+        """
+        Looking in the list of open_files you can _often_ see
+        that a log file is open which indicates which OSD_ID is 
+        being used. This avoids the necessity to do a reverse lookup
+        for the OSD_ID
+        """
+        osd_id = set()
+        for open_file in self.proc.open_files():
+            mo = re.search('[0-9]+', open_file.path)
+            if mo:
+                osd_id.add(mo.group())
+            else:
+                raise NoOSDIDFound
+        return osd_id.pop()
+
+
+class NoOSDIDFound(Exception):
+    """
+    Custom Exception to raise when there is no OSD ID is found.
+    """
+    pass
+
+
 def check(results=False, quiet=False, **kwargs):
 
     """
@@ -56,6 +107,7 @@ def check(results=False, quiet=False, **kwargs):
     fail.  If results flag is set, return a dictionary of the form:
       { 'down': [ process, ... ], 'up': { process: [ pid, ... ], ...} }
     """
+    res_map = list()
     running = True
     res = {'up': {}, 'down': []}
 
@@ -68,42 +120,17 @@ def check(results=False, quiet=False, **kwargs):
         for role in kwargs.get('roles', __pillar__['roles']):
             # Checking running first.
             for running_proc in psutil.process_iter():
-                # NOTE about `ps` and psutils.Process():
-                # `ps -e` determines process names by examining
-                # /proc/PID/stat,status files.  The name derived
-                # there is also found in psutil.Process.name.
-                # `ps -ef`, according to strace, appears to also reference
-                # /proc/PID/cmdline when determining
-                # process names.  We have found that some processes (ie.
-                # ceph-mgr was noted) will _sometimes_
-                # contain a process name in /proc/PIDstat/stat,status that does
-                # not match that found in /proc/PID/cmdline.
-                # In our ceph-mgr example, the process name was found to be
-                # 'exe' (which happens to also be the name a of
-                # symlink in /proc/PID that points to the executable) while the
-                # cmdline entry contained 'ceph-mgr' etc.
-                # As such, we've decided that a check based on executable
-                # path is more reliable.
-                pdict = running_proc.as_dict(attrs=['pid', 'name', 'exe', 'uids'])
-                pdict_exe = os.path.basename(pdict['exe'])
-                pdict_name = pdict['name']
-                pdict_pid = pdict['pid']
-                # Convert the numerical UID to name.
-                pdict_uid = pwd.getpwuid(pdict['uids'].real).pw_name
-                if pdict_exe in processes[role] or pdict_name in processes[role]:
-                    # When we don't have a binary but a python program
-                    # we want to use it's name for the 'exe'
-                    # Example:
-                    # pdict_exe for a lrbd is '/usr/bin/python2.7'
-                    # pdict['name'] is the actual name of the .py file to be executed
-                    if 'python' in pdict_exe:
-                        pdict_exe = pdict_name
+                prc = ProcInfo(running_proc)
+                if prc.exe in processes[role] or prc.name in processes[role]:
                     # Verify httpd-worker pid belongs to openattic.
-                    if (role != 'openattic') or (role == 'openattic' and pdict_uid == 'openattic'):
-                        if pdict_exe in res['up']:
-                            res['up'][pdict_exe] = res['up'][pdict_exe] + [pdict_pid]
+                    if (role != 'openattic') or (role == 'openattic' and prc.uid == 'openattic'):
+                        prc.up = True
+                        res_map.append(prc)
+
+                        if prc.exe in res['up']:
+                            res['up'][prc.exe].append(prc.pid)
                         else:
-                            res['up'][pdict_exe] = [pdict_pid]
+                            res['up'][prc.exe] = [prc.pid]
 
             if role in absent_processes.keys():
                 for proc in absent_processes[role]:
@@ -128,6 +155,7 @@ def check(results=False, quiet=False, **kwargs):
             # which osd is down exactly.
             if role == 'storage':
                 if 'ceph-osd' in res['up']:
+                    import pdb;pdb.set_trace()
                     if len(__salt__['osd.list']()) > len(res['up']['ceph-osd']):
                         if not quiet:
                             log.error("ERROR: At least one OSD is not running")
