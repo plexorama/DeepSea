@@ -44,6 +44,27 @@ processes = {'mon': ['ceph-mon'],
              'benchmark-fs': [],
              'master': []}
 
+
+class Process(object):
+
+    def __repr__(self):
+        return "ProcMap <{}>".format(self.name)
+
+    def __init__(self, name, services):
+        self.name = name
+        self.services = services
+
+    @property
+    def service_names(self):
+        return self.services
+
+    @service_names.setter
+    def set_service_names(self, services):
+        self.services = services
+
+
+mon = Process('mon', ['ceph-mon'])
+
 # Processes like lrbd have an inverted logic
 # if they are running it means that the service is _NOT_ ready
 # as opposed to the the services in the 'processes' map.
@@ -71,7 +92,8 @@ class ProcInfo(object):
             self.osd_id = None
         if 'python' in self.exe:
             self.exe = self.name
-        self.up = False
+        if self.proc.status() == 'running':
+            self.up = False
 
     def __repr__(self):
         return "Process <{}>".format(self.name)
